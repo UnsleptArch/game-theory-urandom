@@ -89,19 +89,91 @@ fail-safe-to-trusted-seed, not a claim that beats total determinism.
       kernel's built-in `qemu_fw_cfg` driver exposes it at
       `/sys/firmware/qemu_fw_cfg/by_name/opt/seed/raw`; confirmed readable
       from guest userspace and from the kernel module.
-- [x] Kernel module (`kernel-module/gt_urandom.c`): online health tests on
-      RDRAND (repeated-sample variance check, mirrors the kernel's own
-      test) and on live virtio-rng output (reads `/dev/hwrng` via a
-      `call_usermodehelper()`-run `dd` into a tmpfs scratch file, since
-      `hw_random`'s misc device only implements the legacy `f_op->read`
-      and `kernel_read()` requires `->read_iter` on this kernel). Policy:
-      RDRAND and virtio-rng are *always* untrusted (0 entropy credit)
-      regardless of health-test result -- a competent attacker's RDRAND
-      stream can look statistically fine, so detection is a bonus signal,
-      not the safety mechanism. The fw_cfg seed is the only source
-      credited, via `add_hwgenerator_randomness()` with full credit.
-      Telemetry under `/sys/kernel/debug/gt_urandom/{summary,rdrand,
-      virtio_rng,seed}`. Builds clean against `build/linux-src`.
+- [x] Kernel module, C reference implementation (`kernel-module/gt_urandom.c`,
+      superseded by the Rust module below, kept in the repo as the
+      original implementation): online health tests on RDRAND and live
+      virtio-rng output (reads `/dev/hwrng` via a `call_usermodehelper()`-run
+      `dd` into a tmpfs scratch file, since `hw_random`'s misc device only
+      implements the legacy `f_op->read` and `kernel_read()` requires
+      `->read_iter` on this kernel), hardcoded "always distrust RDRAND/
+      virtio-rng, always trust the fw_cfg seed" policy, debugfs telemetry.
+- [x] **Kernel module, Rust (`kernel-module-rust/gt_urandom_rs.rs`) -- this
+      is the one the demo actually loads and the project exists to show.**
+      Built as an in-tree Rust-for-Linux sample (`kernel-module-rust/build.sh`
+      stages the source into `build/linux-src/samples/rust/` and patches its
+      Kconfig/Makefile; out-of-tree `M=...` Rust module builds don't invoke
+      the Rust build rules, so this goes through the normal in-tree
+      `make modules`, same as any other Rust sample). Requires
+      `CONFIG_RUST=y` (enabled on the guest kernel) and the `rust-bindgen`
+      package (installed; `rustc`/`cargo`/`rust-src` were already present
+      via rustup). Uses the same raw FFI bindings as the C module for parts
+      not yet safely wrapped in `rust/kernel` (`filp_open`/`kernel_read`/
+      `filp_close`/`call_usermodehelper`/`add_hwgenerator_randomness`;
+      RDRAND itself via inline `asm!`).
+
+      **The actual game-theoretic model (two layers, all four
+      guest-visible sources tested/played, not just RDRAND+virtio-rng):**
+
+      - Layer 1, adaptive multi-round belief tracking: RDRAND, virtio-rng,
+        and the fw_cfg seed each run several independent rounds of their
+        health test (RDRAND: 4 rounds x 4 samples; virtio-rng: 4 rounds x
+        16 bytes; seed: 1 round, a basic sanity check -- see below). After
+        *each* round the module updates a posterior corruption belief via
+        sequential Bayes' rule (not a single static formula), with
+        evidence likelihoods parameterized by the source's own
+        cost-to-fake, so a source whose apparent behavior changes
+        part-way through gets its belief revised in real time -- this is
+        the "adaptive opponent model" layer. The 4th source, guest-visible
+        **timing**, gets NO live test (see below for why) but is still
+        fully scored and played in layer 2.
+      - Layer 2, equilibrium credit allocation: a minimax safety filter
+        drops any source whose final belief is still at/above
+        `SAFETY_THRESHOLD_PPM` to zero credit, full stop. Among sources
+        that survive, credit is split *proportional to cost-to-fake* --
+        the Nash equilibrium of a proportional (Tullock-style) contest
+        game, not a hardcoded "100% to one source" rule. With this
+        project's declared costs (RDRAND/virtio-rng/timing: 1 unit;
+        fw_cfg-seed: 10,000 units) only the seed ever survives layer 1 in
+        practice, so it gets a 100% share -- but the mechanism is general.
+
+      All fixed-point parts-per-million integer math (no floats in kernel
+      code). Telemetry under `/sys/kernel/debug/gt_urandom_rs/{summary,
+      rdrand,virtio_rng,timing,seed,policy}` shows every round's raw
+      evidence and belief evolution, not just the final policy.
+
+      **Timing/jitter: built, calibrated, and deliberately not shipped as
+      a live test.** Implemented an RDTSC-based tight-loop jitter
+      measurement and calibrated it live, both under this project's
+      `-icount` attack config and under plain TCG, across several
+      workload sizes. The hoped-for signal (icount-controlled timing
+      being detectably more regular than real jitter) did not hold up
+      reliably -- both configurations showed comparable regularity via
+      different mechanisms. Rather than ship a flaky pass/fail, timing is
+      scored with no live test: its belief is just its cost-derived prior
+      (worst case, never reduced), which is also the intellectually
+      honest reading of this project's own stated hard limit (guest-
+      visible timing under a fully hostile hypervisor isn't something a
+      guest-side test can independently verify).
+
+      **Two real bugs caught via live boots, not code review:**
+      1. The first scoring version (one-shot formula, `HEALTH_CLEAR_BP
+         =10%`, threshold=50%) let RDRAND's posterior corruption (45%)
+         dip under the 50% threshold after a passing health test, so the
+         module actually *credited* RDRAND -- the exact failure this
+         project exists to prevent.
+      2. Simulating the fix by hand before rebuilding caught that the
+         fix needed re-deriving for the *current* round count, not just a
+         lower threshold in isolation -- done by hand-computing 4 rounds
+         of sequential Bayes updates (500,000 -> ... -> 459,042ppm worst
+         case for a cost=1 source) and setting `SAFETY_THRESHOLD_PPM=
+         400,000` with margin below that, which the live debugfs output
+         then matched almost exactly (45.88% observed vs. ~45.90%
+         hand-derived).
+
+      Re-verified via live boots after every change: RDRAND and
+      virtio-rng both UNTRUSTED (45.88% and 99.84% final belief), timing
+      UNTRUSTED (50.00%, untested prior), fw_cfg-seed TRUSTED (0.00%
+      belief, 100% equilibrium weight, 256 bits credited).
 - [x] Launch scripts: `scripts/launch-attack.sh`, `scripts/launch-fix.sh`.
       Module loaded only in the fix path via `gt=1` on the kernel cmdline,
       read by `guest/overlay/init`. Note: plain QEMU `-icount` does *not*
@@ -131,6 +203,10 @@ fail-safe-to-trusted-seed, not a claim that beats total determinism.
 - QEMU: `qemu-system-x86_64` 11.1.2, from Arch package `qemu-system-x86`.
 - No Buildroot, no docker/podman installed. Network access confirmed working.
 - 16 cores, 61G RAM, 1.5T free disk — not a constraint for this build.
+- `bc` installed (needed by the kernel build's `timeconst.h` generation;
+  wasn't present initially). `rust-bindgen` installed (needed for
+  `CONFIG_RUST`; `rustc`/`cargo`/`rust-src` were already present via
+  rustup, `make rustavailable` passes without `LLVM=1`).
 
 ## Non-goals (explicitly out of scope, don't drift into these)
 

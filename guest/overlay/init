@@ -12,11 +12,11 @@ else
 fi
 # Fix config: load module if present and requested (gt=1 on cmdline)
 echo "GT: hwrng check: $("$bb" ls -la /dev/hwrng 2>&1)"
-if "$bb" grep -qw gt=1 /proc/cmdline && [ -f /lib/modules/gt_urandom.ko ]; then
-  "$bb" insmod /lib/modules/gt_urandom.ko && echo "GT: module loaded"
-  for f in summary rdrand virtio_rng seed; do
-    echo "== gt_urandom/$f =="
-    "$bb" cat /sys/kernel/debug/gt_urandom/$f 2>&1
+if "$bb" grep -qw gt=1 /proc/cmdline && [ -f /lib/modules/gt_urandom_rs.ko ]; then
+  "$bb" insmod /lib/modules/gt_urandom_rs.ko && echo "GT: module loaded"
+  for f in summary rdrand virtio_rng seed policy; do
+    echo "== gt_urandom_rs/$f =="
+    "$bb" cat /sys/kernel/debug/gt_urandom_rs/$f 2>&1
   done
 fi
 echo "GT: entropy_avail=$("$bb" cat /proc/sys/kernel/random/entropy_avail)"
