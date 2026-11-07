@@ -28,7 +28,7 @@ QEMU="$R/build/qemu-src/build-out/qemu-system-x86_64"
 head -c 32 /dev/urandom > "$R/build/seed-telemetry.bin"
 OUT=$(mktemp)
 GT_POISON_RDRAND=deadbeefcafef00d timeout 30 "$QEMU" \
-  -machine q35 -cpu qemu64,+rdrand -m 512 -smp 1 -accel tcg -icount shift=0,sleep=off \
+  -machine q35 -cpu qemu64,+rdrand -m 512 -smp 1 -accel tcg -icount shift=6,sleep=off \
   -kernel "$R/build/linux-src/arch/x86/boot/bzImage" \
   -initrd "$R/build/initramfs.cpio.gz" \
   -append "console=ttyS0 panic=-1 quiet gt=1" \

@@ -21,8 +21,9 @@ set -e
 R=$(cd "$(dirname "$0")/.." && pwd)
 QEMU="$R/build/qemu-src/build-out/qemu-system-x86_64"
 RR="$R/build/attack.rr"
+RR_SEED_STAMP="$R/build/attack.rr.seed"
 N="${1:-3}"
-TMO="${TMO:-90}"
+TMO="${TMO:-30}"
 
 [ -f "$R/build/fixed-rng.bin" ] || head -c 4096 /dev/zero | tr '\0' 'A' > "$R/build/fixed-rng.bin"
 
@@ -39,19 +40,43 @@ COMMON=(-machine q35 -cpu qemu64,+rdrand -m 512 -smp 1 -accel tcg
 export GT_POISON_RDRAND="${GT_POISON_RDRAND:-deadbeefcafef00d}"
 echo "GT: attacker-chosen RDRAND seed = $GT_POISON_RDRAND"
 
+# A recorded trace (-icount rr=record) is only valid for the exact seed it
+# was recorded with. If the seed changed since the last recording (or no
+# stamp exists), the old trace is stale -- drop it and re-record, rather
+# than silently replaying a trace that doesn't match GT_POISON_RDRAND.
+if [ -f "$RR" ] && [ "$(cat "$RR_SEED_STAMP" 2>/dev/null)" != "$GT_POISON_RDRAND" ]; then
+  echo "GT: recorded trace is for a different seed -- discarding stale $RR"
+  rm -f "$RR"
+fi
+
 if [ ! -f "$RR" ]; then
   echo "GT: recording attacker-controlled run -> $RR"
   OUT="$R/build/attack-record.log"
-  timeout "$TMO" "$QEMU" -icount shift=0,rr=record,rrfile="$RR" \
+  timeout "$TMO" "$QEMU" -icount shift=6,rr=record,rrfile="$RR" \
     "${COMMON[@]}" -serial file:"$OUT" >/dev/null 2>&1
   grep -E "GT-HOSTKEY" "$OUT" || { echo "GT: record run produced no key" >&2; exit 1; }
+  echo "$GT_POISON_RDRAND" > "$RR_SEED_STAMP"
 fi
 
+keys=()
 for i in $(seq 1 "$N"); do
   OUT=$(mktemp)
-  timeout "$TMO" "$QEMU" -icount shift=0,rr=replay,rrfile="$RR" \
+  timeout "$TMO" "$QEMU" -icount shift=6,rr=replay,rrfile="$RR" \
     "${COMMON[@]}" -serial file:"$OUT" >/dev/null 2>&1
   echo -n "boot $i: "
-  grep -E "GT-HOSTKEY" "$OUT" || echo "(no key -- replay failed, see $OUT)"
+  line=$(grep -E "GT-HOSTKEY" "$OUT") || { echo "(no key -- replay failed, see $OUT)"; rm -f "$OUT"; exit 1; }
+  echo "$line"
+  keys+=("$line")
   rm -f "$OUT"
 done
+
+all_same=1
+for ((i = 1; i < ${#keys[@]}; i++)); do
+  [ "${keys[i]}" = "${keys[0]}" ] || all_same=0
+done
+if [ "$all_same" = 1 ]; then
+  echo "GT: VERDICT -- all $N boots produced the IDENTICAL key (attack succeeded)"
+else
+  echo "GT: VERDICT -- keys DIFFER across boots (unexpected for the attack config!)" >&2
+  exit 1
+fi

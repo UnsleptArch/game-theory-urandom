@@ -26,6 +26,7 @@ TMO="${TMO:-30}"
 export GT_POISON_RDRAND="${GT_POISON_RDRAND:-deadbeefcafef00d}"
 echo "GT: attacker-chosen RDRAND seed = $GT_POISON_RDRAND (same attacker as the attack config)"
 
+keys=()
 for i in $(seq 1 "$N"); do
   # A fresh random seed blob per boot models a real provisioning/
   # attestation system handing each VM its own trusted material -- not the
@@ -34,7 +35,7 @@ for i in $(seq 1 "$N"); do
   head -c 32 /dev/urandom > "$SEED"
   OUT=$(mktemp)
   timeout "$TMO" "$QEMU" \
-    -machine q35 -cpu qemu64,+rdrand -m 512 -smp 1 -accel tcg -icount shift=0,sleep=off \
+    -machine q35 -cpu qemu64,+rdrand -m 512 -smp 1 -accel tcg -icount shift=6,sleep=off \
     -kernel "$R/build/linux-src/arch/x86/boot/bzImage" \
     -initrd "$R/build/initramfs.cpio.gz" \
     -append "console=ttyS0 panic=-1 quiet gt=1 ${GT_APPEND}" \
@@ -44,6 +45,19 @@ for i in $(seq 1 "$N"); do
     -fw_cfg name=opt/seed,file="$SEED" \
     -serial file:"$OUT" ${GT_QEMU_EXTRA} >/dev/null 2>&1
   echo -n "boot $i: "
-  grep -E "GT-HOSTKEY" "$OUT" || echo "(no key -- boot failed, see $OUT)"
+  line=$(grep -E "GT-HOSTKEY" "$OUT") || { echo "(no key -- boot failed, see $OUT)"; rm -f "$OUT"; exit 1; }
+  echo "$line"
+  keys+=("$line")
   rm -f "$OUT"
 done
+
+all_same=1
+for ((i = 1; i < ${#keys[@]}; i++)); do
+  [ "${keys[i]}" = "${keys[0]}" ] || all_same=0
+done
+if [ "$all_same" = 1 ]; then
+  echo "GT: VERDICT -- all $N boots produced the SAME key (unexpected for the fix config!)" >&2
+  exit 1
+else
+  echo "GT: VERDICT -- keys DIFFER across boots (fix succeeded)"
+fi
