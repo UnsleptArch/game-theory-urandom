@@ -1,0 +1,12 @@
+build/
+# execute-only (---x--x--x) by design; unreadable even by its owner, so
+# `git add` can't read it. The guest init script never relies on this
+# applet anyway (it calls busybox directly; see guest/overlay/init).
+guest/rootfs/bin/bbsuid
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order

@@ -1,0 +1,8 @@
+alpine-baselayout
+alpine-keys
+alpine-release
+apk-tools
+busybox
+busybox-suid
+libc-utils
+openssh
