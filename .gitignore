@@ -10,3 +10,6 @@ guest/rootfs/bin/bbsuid
 *.cmd
 Module.symvers
 modules.order
+# Recomputed from this repo's own artifacts every build (see
+# kernel-module-rust/build.sh) -- committing it would let it drift stale.
+kernel-module-rust/cost_measurements.generated.rs

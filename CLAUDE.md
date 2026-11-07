@@ -141,6 +141,34 @@ fail-safe-to-trusted-seed, not a claim that beats total determinism.
       rdrand,virtio_rng,timing,seed,policy}` shows every round's raw
       evidence and belief evolution, not just the final policy.
 
+      **Cost-to-fake values are dynamically sourced, not hand-typed.**
+      `kernel-module-rust/build.sh` measures the actual added-line count
+      of `qemu-patch/0001-rdrand-poison.patch` (32 lines) and confirms
+      virtio-rng/timing need zero QEMU source changes (both are
+      documented stock CLI flags in `scripts/launch-attack.sh`), writing
+      the results to a generated, gitignored
+      `cost_measurements.generated.rs` that `gt_urandom_rs.rs` `include!`s
+      -- recomputed every build, so it can't silently drift from the
+      patch it's measuring. Those raw measurements pass through a bounded
+      `const fn` (`cost_from_measured_patch_lines`) that maps them onto
+      this module's verified-safe cost scale, rather than being used
+      directly: raising RDRAND's cost even to 2 (reflecting that it alone
+      needed a patch, unlike the zero-line sources) was tried and
+      verified to break correctness -- cost=2's prior (33.33%) drops to
+      29.77% after `RDRAND_ROUNDS=4` all-pass rounds, under
+      `SAFETY_THRESHOLD_PPM`, where cost=1 correctly stays at 45.88%. So
+      the mapping function asserts (at *build* time, via a const-context
+      panic) that the measured line count stays under a documented,
+      conservative limit (100) before assigning the verified-safe cost --
+      confirmed this actually fires, not just documented: temporarily set
+      the measured value to 150 and watched the build fail with that
+      exact assertion, then restored the real value and rebuilt clean.
+      fw_cfg-seed's cost isn't measurable the same way (no patch to count
+      lines of -- its entire premise is being outside the attacker's
+      process) and is instead derived as an explicit multiple of the base
+      in-process cost, so it moves with it if that ever changes rather
+      than being an independent magic number.
+
       **Timing/jitter: built, calibrated, and deliberately not shipped as
       a live test.** Implemented an RDTSC-based tight-loop jitter
       measurement and calibrated it live, both under this project's

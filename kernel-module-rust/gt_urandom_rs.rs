@@ -100,17 +100,70 @@ impl core::fmt::Display for Pct {
     }
 }
 
-/// Cost units for a hypervisor to fake this source's output in the threat
-/// model this project targets. RDRAND and virtio-rng are both "one write
-/// to a QEMU launch flag" cheap. The fw_cfg seed models a provisioning/
-/// attestation channel outside the simulated hypervisor's reach entirely
-/// -- cost isn't "high", it's "outside this attacker's attack surface",
-/// approximated with a large value rather than a special-cased infinity
-/// so the same formulas below apply uniformly to every source.
-const COST_RDRAND: u32 = 1;
-const COST_VIRTIO_RNG: u32 = 1;
-const COST_TIMING: u32 = 1;
-const COST_FWCFG_SEED: u32 = 10_000;
+// Cost-to-fake inputs are measured from this repo's own artifacts at
+// *build* time, not hand-typed here -- kernel-module-rust/build.sh counts
+// the actual added-line diff of qemu-patch/0001-rdrand-poison.patch
+// (32 lines as of this writing) and confirms virtio-rng/timing need zero
+// QEMU source changes (both are documented, stock CLI flags in
+// scripts/launch-attack.sh), writing the results to this generated,
+// gitignored file, included verbatim below. If that patch's size
+// changes, these values -- and this module's build -- change with it,
+// instead of a hand-typed number silently going stale.
+include!("cost_measurements.generated.rs");
+
+/// Verified-safe boundary for the cheap, in-process cost tier (see
+/// `cost_from_measured_patch_lines` below). `prior_corrupt_ppm`'s
+/// `1/(1+cost)` curve is steep enough that even cost=2 (prior 33.33%)
+/// already drops a source's belief to 29.77% after `RDRAND_ROUNDS=4`
+/// all-pass rounds -- under `SAFETY_THRESHOLD_PPM` -- where cost=1
+/// correctly stays at 45.88% (both hand-computed and confirmed against
+/// the live formula). So every measured line count under this limit maps
+/// to the same verified-safe cost=1; at or above it, this module has not
+/// verified what cost/threshold/round-count combination stays safe, and
+/// refuses to guess -- see the `assert!` below. 100 lines is comfortably
+/// above the real measured value (32) and comfortably below "a serious
+/// engineering project": a conservative, round boundary, not a precise
+/// one.
+const CHEAP_TIER_PATCH_LINE_LIMIT: u32 = 100;
+const COST_INPROCESS_CHEAP: u32 = 1;
+
+/// Maps a measured patch-line count into this module's verified-safe
+/// cost scale. Deliberately refuses (via a *build-time* panic, since this
+/// runs in a `const` context) to silently produce a cost for a line count
+/// this module's safety derivation has never been checked against --
+/// better a build failure than an unverified trust decision reaching a
+/// live kernel.
+const fn cost_from_measured_patch_lines(lines: u32) -> u32 {
+    assert!(
+        lines < CHEAP_TIER_PATCH_LINE_LIMIT,
+        "a source's fake now needs more lines of patch than this module's \
+         cheap-tier safety derivation has been checked against -- \
+         SAFETY_THRESHOLD_PPM and the round counts need re-deriving for \
+         this cost before it's safe to assign one automatically (see \
+         CHEAP_TIER_PATCH_LINE_LIMIT's doc comment)",
+    );
+    COST_INPROCESS_CHEAP
+}
+
+const COST_RDRAND: u32 = cost_from_measured_patch_lines(MEASURED_RDRAND_PATCH_LINES);
+const COST_VIRTIO_RNG: u32 = cost_from_measured_patch_lines(MEASURED_VIRTIO_RNG_PATCH_LINES);
+const COST_TIMING: u32 = cost_from_measured_patch_lines(MEASURED_TIMING_PATCH_LINES);
+
+/// The fw_cfg seed sits in a different category entirely, not a bigger
+/// number on the same scale: no finite amount of change to the
+/// attacker's own QEMU process can produce it, because its value is
+/// chosen and injected by a provisioning/attestation step that runs
+/// before and outside the process this threat model grants the attacker
+/// control over (see CLAUDE.md). This can't be "measured" the way the
+/// in-process costs above are -- there's no patch to count lines of --
+/// so it's derived instead, as an explicit multiple of the base
+/// in-process cost rather than an independent magic number: if
+/// `COST_INPROCESS_CHEAP` ever changes, this moves with it automatically.
+/// The multiplier's magnitude doesn't matter precisely -- any value this
+/// large or larger yields the same policy outcome -- only that it's
+/// large enough to make `prior_corrupt_ppm` round to ~0%.
+const OUT_OF_PROCESS_COST_MULTIPLIER: u32 = 10_000;
+const COST_FWCFG_SEED: u32 = COST_INPROCESS_CHEAP * OUT_OF_PROCESS_COST_MULTIPLIER;
 
 /// Round-evidence likelihoods (ppm), keyed by whether the source is cheap
 /// to fake. `(pass | corrupt, pass | honest)`. For a cheap source these
@@ -637,7 +690,16 @@ impl kernel::Module for GtUrandomRs {
         let seed_report = append(&seed_rounds_report, &seed_status);
 
         let mut policy_report = CString::try_from_fmt(fmt!(
-            "layer 1 (adaptive multi-round belief) -> layer 2 (equilibrium credit split):\n"
+            "cost-to-fake, measured at build time from this repo's own artifacts\n\
+             (kernel-module-rust/build.sh; see cost_measurements.generated.rs):\n\
+             RDRAND patch: {} added lines (cheap-tier limit: {})\n\
+             virtio-rng patch: {} added lines  timing patch: {} added lines\n\
+             fw_cfg-seed: not measurable this way (out-of-process category, see source)\n\n\
+             layer 1 (adaptive multi-round belief) -> layer 2 (equilibrium credit split):\n",
+            MEASURED_RDRAND_PATCH_LINES,
+            CHEAP_TIER_PATCH_LINE_LIMIT,
+            MEASURED_VIRTIO_RNG_PATCH_LINES,
+            MEASURED_TIMING_PATCH_LINES,
         ))
         .unwrap_or_else(|_| error_cstring());
         for s in &scores {
