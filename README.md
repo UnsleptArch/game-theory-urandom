@@ -39,6 +39,13 @@ checked by the Rust compiler at build time: a dedicated `const fn` proof
 re-runs the module's own belief-update function against the worst case
 and refuses to compile if the threshold doesn't hold.
 
+The module also logs its reasoning live, not just into debugfs after the
+fact: every round's pass/fail and running belief goes to the kernel log as
+it happens, and each source gets a final verdict line once the policy
+resolves, `pr_warn!` (so it stands out in dmesg) for anything untrusted,
+worded per-source rather than one generic template (e.g. RDRAND/virtio-rng
+get "POISONED SOURCE DETECTED" when a live test actually catches them).
+
 ## Layout
 
 - `src/gt_urandom_rs/` — the Rust kernel module (the one the demo loads).
