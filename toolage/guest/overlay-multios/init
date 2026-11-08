@@ -1,0 +1,39 @@
+#!/bin/busybox sh
+# Multi-OS attack demo init: same busybox base environment as the main
+# demo (guest/overlay/init), but runs a DIFFERENT real distro's own
+# ssh-keygen binary depending on gt_distro= on the kernel cmdline, proving
+# the same kernel-level entropy vulnerability reaches each distro's own
+# OpenSSH build unmodified. Module is never loaded here -- this is the
+# attack config only (see CLAUDE.md: the fix config doesn't need repeating
+# per distro, the vulnerability and the fix both live in the kernel, not
+# the userspace calling it).
+bb=/bin/busybox
+"$bb" mount -t proc proc /proc
+"$bb" mount -t sysfs sys /sys
+"$bb" mount -t devtmpfs dev /dev 2>/dev/null
+"$bb" mount -t tmpfs tmp /tmp
+
+DISTRO=$("$bb" sed -n 's/.*gt_distro=\([a-z]*\).*/\1/p' /proc/cmdline)
+"$bb" rm -f /tmp/k /tmp/k.pub
+echo "[*] distro: $DISTRO"
+
+case "$DISTRO" in
+  alpine)
+    /usr/bin/ssh-keygen -q -t ed25519 -N '' -f /tmp/k
+    ;;
+  arch)
+    /opt/arch/lib64/ld-linux-x86-64.so.2 --library-path /opt/arch/usr/lib \
+      /opt/arch/usr/bin/ssh-keygen -q -t ed25519 -N '' -f /tmp/k
+    ;;
+  debian)
+    /opt/debian/lib64/ld-linux-x86-64.so.2 --library-path /opt/debian/usr/lib \
+      /opt/debian/usr/bin/ssh-keygen -q -t ed25519 -N '' -f /tmp/k
+    ;;
+  *)
+    echo "[*] unknown or missing gt_distro= on cmdline"
+    "$bb" poweroff -f
+    ;;
+esac
+
+echo "GT-HOSTKEY: $(/usr/bin/ssh-keygen -lf /tmp/k.pub)"
+"$bb" poweroff -f

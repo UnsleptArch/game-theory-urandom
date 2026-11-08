@@ -1,4 +1,8 @@
 #!/bin/busybox sh
+# Cosmetic note: the "GT-HOSTKEY:" line below is matched by anchored
+# sed/grep patterns in several host-side scripts (e.g. demo.sh's
+# `sed -n "/== gt_urandom/,/^GT-HOSTKEY/p"`) -- it must stay exactly as
+# printed, with nothing (not even a color code) prepended to it.
 bb=/bin/busybox
 "$bb" mount -t proc proc /proc
 "$bb" mount -t sysfs sys /sys
@@ -6,20 +10,20 @@ bb=/bin/busybox
 "$bb" mount -t debugfs none /sys/kernel/debug 2>/dev/null
 "$bb" mount -t tmpfs tmp /tmp
 if [ -e /sys/firmware/qemu_fw_cfg/by_name/opt/seed/raw ]; then
-  echo "GT: fw_cfg opt/seed present, $("$bb" wc -c < /sys/firmware/qemu_fw_cfg/by_name/opt/seed/raw) bytes"
+  echo "[*] fw_cfg opt/seed present, $("$bb" wc -c < /sys/firmware/qemu_fw_cfg/by_name/opt/seed/raw) bytes"
 else
-  echo "GT: fw_cfg opt/seed NOT present"
+  echo "[*] fw_cfg opt/seed NOT present"
 fi
 # Fix config: load module if present and requested (gt=1 on cmdline)
-echo "GT: hwrng check: $("$bb" ls -la /dev/hwrng 2>&1)"
+echo "[*] hwrng: $("$bb" ls -la /dev/hwrng 2>&1)"
 if "$bb" grep -qw gt=1 /proc/cmdline && [ -f /lib/modules/gt_urandom_rs.ko ]; then
-  "$bb" insmod /lib/modules/gt_urandom_rs.ko && echo "GT: module loaded"
+  "$bb" insmod /lib/modules/gt_urandom_rs.ko && echo "[*] gt_urandom_rs module loaded"
   for f in summary rdrand virtio_rng seed policy; do
     echo "== gt_urandom_rs/$f =="
     "$bb" cat /sys/kernel/debug/gt_urandom_rs/$f 2>&1
   done
 fi
-echo "GT: entropy_avail=$("$bb" cat /proc/sys/kernel/random/entropy_avail)"
+echo "[*] entropy_avail=$("$bb" cat /proc/sys/kernel/random/entropy_avail)"
 "$bb" rm -f /tmp/k /tmp/k.pub
 /usr/bin/ssh-keygen -q -t ed25519 -N '' -f /tmp/k
 echo "GT-HOSTKEY: $(/usr/bin/ssh-keygen -lf /tmp/k.pub)"

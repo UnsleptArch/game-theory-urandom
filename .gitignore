@@ -1,8 +1,8 @@
 build/
 # execute-only (---x--x--x) by design; unreadable even by its owner, so
 # `git add` can't read it. The guest init script never relies on this
-# applet anyway (it calls busybox directly; see guest/overlay/init).
-guest/rootfs/bin/bbsuid
+# applet anyway (it calls busybox directly; see toolage/guest/overlay/init).
+toolage/guest/rootfs/bin/bbsuid
 *.ko
 *.o
 *.mod
@@ -11,5 +11,8 @@ guest/rootfs/bin/bbsuid
 Module.symvers
 modules.order
 # Recomputed from this repo's own artifacts every build (see
-# kernel-module-rust/build.sh) -- committing it would let it drift stale.
-kernel-module-rust/cost_measurements.generated.rs
+# src/gt_urandom_rs/build.sh) -- committing it would let it drift stale.
+src/gt_urandom_rs/cost_measurements.generated.rs
+# Working notes for Claude Code across sessions, not part of the
+# submission.
+CLAUDE.md

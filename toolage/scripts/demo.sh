@@ -4,24 +4,18 @@
 # poisoned RDRAND/virtio-rng/no-NIC, expect different keys), then show the
 # module's debugfs telemetry from one fix-config boot.
 set -e
-R=$(cd "$(dirname "$0")/.." && pwd)
+R=$(cd "$(dirname "$0")/../.." && pwd)
+. "$R/toolage/scripts/lib/style.sh"
 N="${1:-3}"
 
-echo "=================================================================="
-echo " ATTACK CONFIG: module NOT loaded ($N boots, same poisoned inputs)"
-echo "=================================================================="
+gt_log "phase 1: attack config ($N boots, module not loaded)"
 rm -f "$R/build/attack.rr"
-"$R/scripts/launch-attack.sh" "$N"
-echo
-echo "=================================================================="
-echo " FIX CONFIG: gt_urandom module loaded ($N independent boots,"
-echo " same poisoned RDRAND/virtio-rng/no-NIC as the attack config)"
-echo "=================================================================="
-"$R/scripts/launch-fix.sh" "$N"
-echo
-echo "=================================================================="
-echo " gt_urandom telemetry from a fix-config boot"
-echo "=================================================================="
+"$R/toolage/scripts/launch-attack.sh" "$N"
+
+gt_log "phase 2: defense config ($N boots, module loaded, same poisoned inputs)"
+"$R/toolage/scripts/launch-fix.sh" "$N"
+
+gt_log "phase 3: defense module telemetry, live"
 GT_QEMU_EXTRA="" TMO=30 bash -c '
 R="'"$R"'"
 QEMU="$R/build/qemu-src/build-out/qemu-system-x86_64"

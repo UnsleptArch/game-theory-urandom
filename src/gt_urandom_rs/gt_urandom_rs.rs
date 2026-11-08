@@ -196,13 +196,17 @@ const COSTLY_L_PASS_GIVEN_HONEST_PPM: u64 = 990_000; // 99%
 const SAFETY_THRESHOLD_PPM: u32 = 400_000; // 40%
 
 /// Prior corruption probability (ppm) from cost-to-fake: cheap -> high
-/// prior. `1_000_000 / (1 + cost)`.
-fn prior_corrupt_ppm(cost: u32) -> u32 {
+/// prior. `1_000_000 / (1 + cost)`. `const fn` so it can also run at
+/// compile time, in the safety proof below.
+const fn prior_corrupt_ppm(cost: u32) -> u32 {
     PPM_SCALE / (1 + cost)
 }
 
 /// One sequential Bayes update from one round's pass/fail evidence.
-fn bayes_update_ppm(prior_ppm: u32, passed: bool, cheap: bool) -> u32 {
+/// `const fn` so it can also run at compile time, in the safety proof
+/// below -- the exact same update logic that runs at boot, not a
+/// hand-reimplemented copy of it, is what gets proven safe.
+const fn bayes_update_ppm(prior_ppm: u32, passed: bool, cheap: bool) -> u32 {
     let (l_pass_corrupt, l_pass_honest) = if cheap {
         (CHEAP_L_PASS_GIVEN_CORRUPT_PPM, CHEAP_L_PASS_GIVEN_HONEST_PPM)
     } else {
@@ -230,13 +234,29 @@ fn bayes_update_ppm(prior_ppm: u32, passed: bool, cheap: bool) -> u32 {
 /// whether it passed, appending whatever it wants to `detail` as it goes
 /// (e.g. raw samples); this function appends the round number, verdict,
 /// and running belief after each round.
+///
+/// Every round is also pushed straight to the kernel log via `pr_info!`,
+/// not just into the debugfs report this function also builds. debugfs
+/// only shows what it's asked to show, after the fact, by whoever cats
+/// it; dmesg/the serial console shows this live, interleaved with the
+/// rest of boot, without anyone needing to know to go looking for it --
+/// that's the actual point of "verbose and transparent" for a module
+/// whose whole job is a trust decision nobody should have to take on
+/// faith.
 fn run_rounds<F: FnMut(usize, &mut CString) -> bool>(
+    name: &str,
     cost: u32,
     cheap: bool,
     rounds: usize,
     mut round_fn: F,
 ) -> (u32, CString) {
     let mut belief = prior_corrupt_ppm(cost);
+    pr_info!(
+        "{}: starting health test, cost_to_fake={} prior_corrupt={}\n",
+        name,
+        cost,
+        Pct(belief)
+    );
     let mut detail = CString::try_from_fmt(fmt!(
         "cost_to_fake={} prior_corrupt={}\n",
         cost,
@@ -246,6 +266,14 @@ fn run_rounds<F: FnMut(usize, &mut CString) -> bool>(
     for i in 0..rounds {
         let passed = round_fn(i, &mut detail);
         belief = bayes_update_ppm(belief, passed, cheap);
+        pr_info!(
+            "{}: round {}/{}: {} -> belief_corrupt={}\n",
+            name,
+            i + 1,
+            rounds,
+            if passed { "pass" } else { "FAIL" },
+            Pct(belief),
+        );
         let line = CString::try_from_fmt(fmt!(
             "  round {}/{}: {} -> belief_corrupt={}\n",
             i + 1,
@@ -274,16 +302,37 @@ struct SourceScore {
 /// didn't clear the filter get exactly zero, independent of this split.
 fn compute_equilibrium(scores: &mut [SourceScore]) {
     let mut survivor_cost_total: u64 = 0;
+    let mut survivor_count: usize = 0;
     for s in scores.iter() {
         if s.final_belief_ppm < SAFETY_THRESHOLD_PPM {
             survivor_cost_total += s.cost as u64;
+            survivor_count += 1;
         }
     }
+    // Each survivor's share is floored independently, so a naive split
+    // can leave a few ppm unallocated whenever more than one source
+    // survives (never over-allocated -- the safe direction -- but not
+    // exactly the 100% a proportional contest's equilibrium calls for
+    // either). The last survivor visited absorbs whatever's left instead
+    // of also being floored, so the weights always sum to exactly
+    // PPM_SCALE when there's at least one survivor, matching this
+    // function's own doc comment that the split is a real N-way
+    // proportional contest, not just correct for the single-survivor
+    // case this project's current costs happen to produce.
+    let mut allocated: u32 = 0;
+    let mut seen: usize = 0;
     for s in scores.iter_mut() {
         s.equilibrium_weight_ppm = if s.final_belief_ppm < SAFETY_THRESHOLD_PPM
             && survivor_cost_total > 0
         {
-            ((s.cost as u64) * (PPM_SCALE as u64) / survivor_cost_total) as u32
+            seen += 1;
+            if seen == survivor_count {
+                PPM_SCALE - allocated
+            } else {
+                let w = ((s.cost as u64) * (PPM_SCALE as u64) / survivor_cost_total) as u32;
+                allocated += w;
+                w
+            }
         } else {
             0
         };
@@ -415,11 +464,16 @@ const HWRNG_TMP_PATH: &CStr = c_str!("/tmp/.gt_hwrng_sample_rs");
 /// back; the hw_random misc device does not -- see module doc above).
 fn sample_hwrng(buf: &mut [u8]) -> Result<usize> {
     let count_arg = CString::try_from_fmt(fmt!("count={}", buf.len()))?;
+    // Built from HWRNG_TMP_PATH, not a second hand-typed literal: the path
+    // `dd` writes to and the path `read_file_raw` reads back from must be
+    // the same string, and deriving one from the other is what actually
+    // guarantees that instead of relying on two literals staying in sync.
+    let of_arg = CString::try_from_fmt(fmt!("of={}", HWRNG_TMP_PATH.to_str().unwrap_or("")))?;
     let argv: [*const u8; 7] = [
         c_str!("/bin/busybox").as_char_ptr().cast(),
         c_str!("dd").as_char_ptr().cast(),
         c_str!("if=/dev/hwrng").as_char_ptr().cast(),
-        c_str!("of=/tmp/.gt_hwrng_sample_rs").as_char_ptr().cast(),
+        of_arg.as_char_ptr().cast(),
         c_str!("bs=1").as_char_ptr().cast(),
         count_arg.as_char_ptr().cast(),
         core::ptr::null(),
@@ -449,6 +503,45 @@ fn sample_hwrng(buf: &mut [u8]) -> Result<usize> {
 const VIRTIO_ROUNDS: usize = 4;
 const VIRTIO_BYTES_PER_ROUND: usize = 16;
 const VIRTIO_DEGENERATE_PCT: u32 = 80;
+
+// ==== compile-time safety proof ====
+//
+// SAFETY_THRESHOLD_PPM's doc comment above justifies 400_000ppm with a
+// hand simulation of RDRAND_ROUNDS=4 consecutive passes. A hand
+// simulation is only ever checked once, at the moment someone writes
+// it -- if RDRAND_ROUNDS or VIRTIO_ROUNDS is ever changed later without
+// also re-deriving the threshold, that comment goes stale silently and
+// the module could start crediting a corrupted cheap source, which is
+// the exact failure this module exists to prevent (and the exact bug a
+// live boot once caught in an earlier version of this scoring). Rather
+// than trust a comment to get re-checked by hand, this re-runs the
+// *actual* `bayes_update_ppm` the module calls at boot, at compile time,
+// for the worst case a cheap (cost=1) source can produce -- passing
+// every single round -- for both of this module's cheap sources' real
+// round counts, and refuses to build at all if either one no longer
+// clears the threshold.
+const fn worst_case_cheap_belief_after_passes(rounds: usize) -> u32 {
+    let mut belief = prior_corrupt_ppm(COST_INPROCESS_CHEAP);
+    let mut i = 0;
+    while i < rounds {
+        belief = bayes_update_ppm(belief, true, true);
+        i += 1;
+    }
+    belief
+}
+
+const _: () = assert!(
+    worst_case_cheap_belief_after_passes(RDRAND_ROUNDS) >= SAFETY_THRESHOLD_PPM,
+    "SAFETY_THRESHOLD_PPM no longer has a safety margin for RDRAND_ROUNDS: \
+     a cost=1 source that passes every round would end up credited. \
+     Re-derive SAFETY_THRESHOLD_PPM (or RDRAND_ROUNDS) before shipping this.",
+);
+const _: () = assert!(
+    worst_case_cheap_belief_after_passes(VIRTIO_ROUNDS) >= SAFETY_THRESHOLD_PPM,
+    "SAFETY_THRESHOLD_PPM no longer has a safety margin for VIRTIO_ROUNDS: \
+     a cost=1 source that passes every round would end up credited. \
+     Re-derive SAFETY_THRESHOLD_PPM (or VIRTIO_ROUNDS) before shipping this.",
+);
 
 fn virtio_round(_i: usize, detail: &mut CString) -> bool {
     let mut buf = [0u8; VIRTIO_BYTES_PER_ROUND];
@@ -617,14 +710,31 @@ struct GtUrandomRs {
 
 impl kernel::Module for GtUrandomRs {
     fn init(_module: &'static ThisModule) -> Result<Self> {
-        pr_info!("gt_urandom_rs: loading\n");
+        // This project's launch scripts boot with `quiet` on the kernel
+        // cmdline, which raises console_loglevel enough to suppress even
+        // pr_warn! from ever reaching the serial console (it still lands
+        // in the dmesg ring buffer, just not live on screen) -- silently
+        // defeating the entire point of logging a poisoned-source
+        // detection as it happens. console_verbose() is the kernel's own
+        // API for exactly this (used by, e.g., the OOM killer and panic
+        // paths to force their output through regardless of the console's
+        // configured level): it only raises console_loglevel globally for
+        // the rest of this boot, no arguments, no preconditions, nothing
+        // module-specific to get wrong.
+        //
+        // SAFETY: console_verbose() takes no arguments and has no
+        // preconditions; it only writes the global console_loglevel.
+        unsafe {
+            kernel::bindings::console_verbose();
+        }
+        pr_info!("loading\n");
 
         // ---- layer 1: multi-round adaptive belief tracking, per source ----
 
         let (rdrand_belief, rdrand_report) =
-            run_rounds(COST_RDRAND, true, RDRAND_ROUNDS, rdrand_round);
+            run_rounds("RDRAND", COST_RDRAND, true, RDRAND_ROUNDS, rdrand_round);
         let (virtio_belief, virtio_report) =
-            run_rounds(COST_VIRTIO_RNG, true, VIRTIO_ROUNDS, virtio_round);
+            run_rounds("virtio-rng", COST_VIRTIO_RNG, true, VIRTIO_ROUNDS, virtio_round);
 
         // The seed gets its own small round loop too (SEED_ROUNDS=1 -- see
         // seed_round()'s doc comment for why just one), fed through the
@@ -638,6 +748,7 @@ impl kernel::Module for GtUrandomRs {
         let seed_n = unsafe { read_file_raw(FWCFG_SEED_PATH, O_NONBLOCK, &mut seed_buf) }
             .unwrap_or(0);
         let (seed_belief, seed_rounds_report) = run_rounds(
+            "fw_cfg-seed",
             COST_FWCFG_SEED,
             false,
             SEED_ROUNDS,
@@ -667,6 +778,11 @@ impl kernel::Module for GtUrandomRs {
         // credit -- it just never gets the chance a passing test would
         // otherwise give it.
         let timing_belief = prior_corrupt_ppm(COST_TIMING);
+        pr_info!(
+            "timing: no live health test (see TIMING_NOTE in module \
+             source), scored at its worst-case cost-derived prior belief_corrupt={}\n",
+            Pct(timing_belief),
+        );
         let timing_report = CString::try_from_fmt(fmt!(
             "cost_to_fake={} prior_corrupt={} (== final belief: no live\n\
              health test for this source -- see TIMING_NOTE in module source)\n",
@@ -685,8 +801,103 @@ impl kernel::Module for GtUrandomRs {
         ];
         compute_equilibrium(&mut scores);
 
+        // Final, loud, one-line-per-source verdict straight to the kernel
+        // log, on top of everything run_rounds() already logged live
+        // above. pr_warn! (not pr_info!) for anything untrusted, so a
+        // detected or assumed poisoned source actually stands out in
+        // dmesg/the serial console instead of scrolling past at the same
+        // level as routine boot noise. Wording is deliberately different
+        // per source rather than one generic templated line: RDRAND and
+        // virtio-rng ran a real multi-round test and crossed the safety
+        // threshold, which is a detection; timing never got a test at
+        // all, which is an assumption, not a detection, and this module
+        // doesn't get to claim otherwise in its own log.
+        if scores[0].equilibrium_weight_ppm == 0 {
+            pr_warn!(
+                "POISONED SOURCE DETECTED: RDRAND tested over {} rounds, \
+                 final belief_corrupt={} >= safety threshold {} -- distrusted, \
+                 0 entropy credit\n",
+                RDRAND_ROUNDS, Pct(scores[0].final_belief_ppm), Pct(SAFETY_THRESHOLD_PPM),
+            );
+        } else {
+            pr_info!(
+                "RDRAND: final belief_corrupt={} -- TRUSTED, \
+                 equilibrium_weight={}\n",
+                Pct(scores[0].final_belief_ppm), Pct(scores[0].equilibrium_weight_ppm),
+            );
+        }
+        if scores[1].equilibrium_weight_ppm == 0 {
+            pr_warn!(
+                "POISONED SOURCE DETECTED: virtio-rng tested over {} rounds, \
+                 final belief_corrupt={} >= safety threshold {} -- distrusted, \
+                 0 entropy credit\n",
+                VIRTIO_ROUNDS, Pct(scores[1].final_belief_ppm), Pct(SAFETY_THRESHOLD_PPM),
+            );
+        } else {
+            pr_info!(
+                "virtio-rng: final belief_corrupt={} -- TRUSTED, \
+                 equilibrium_weight={}\n",
+                Pct(scores[1].final_belief_ppm), Pct(scores[1].equilibrium_weight_ppm),
+            );
+        }
+        if scores[2].equilibrium_weight_ppm == 0 {
+            pr_warn!(
+                "timing distrusted by default: no live test ran, \
+                 worst-case prior belief_corrupt={} >= safety threshold {} -- \
+                 0 entropy credit\n",
+                Pct(scores[2].final_belief_ppm), Pct(SAFETY_THRESHOLD_PPM),
+            );
+        } else {
+            pr_info!(
+                "timing: final belief_corrupt={} -- TRUSTED, \
+                 equilibrium_weight={}\n",
+                Pct(scores[2].final_belief_ppm), Pct(scores[2].equilibrium_weight_ppm),
+            );
+        }
+        // fw_cfg-seed's verdict can't be logged from equilibrium_weight_ppm
+        // alone, unlike the other three sources: the layer-1 belief here
+        // comes almost entirely from this source's huge cost-derived
+        // prior, not from the one weak sanity-check round, so "the fw_cfg
+        // blob is completely absent" and "it's present and looks fine"
+        // both land at a belief near 0% and both clear the safety filter
+        // as "TRUSTED". That's fine for the belief math, credit is still
+        // correctly withheld because load_seed() independently checks for
+        // an actual non-empty read before ever calling
+        // add_hwgenerator_randomness() -- but it means this verdict has
+        // to wait for load_seed()'s real result instead of running off
+        // the equilibrium weight like the other three, or it can claim
+        // this boot was seeded from a channel that was never actually
+        // there. (Caught exactly this way: a live boot with no fw_cfg
+        // device configured at all still showed TRUSTED/100% here when
+        // this check ran before load_seed(), while load_seed() itself
+        // correctly reported 0 bytes read and nothing credited.)
         let (seed_bytes_read, seed_status) = load_seed(&scores[3]);
-        let _ = seed_bytes_read;
+        if scores[3].equilibrium_weight_ppm > 0 && seed_bytes_read > 0 {
+            pr_info!(
+                "fw_cfg-seed: final belief_corrupt={} -- TRUSTED, \
+                 equilibrium_weight={}, this is the channel the CRNG actually gets \
+                 seeded from this boot ({} bytes credited)\n",
+                Pct(scores[3].final_belief_ppm), Pct(scores[3].equilibrium_weight_ppm),
+                seed_bytes_read,
+            );
+        } else if scores[3].equilibrium_weight_ppm > 0 {
+            pr_warn!(
+                "fw_cfg-seed: belief_corrupt={} cleared the safety filter, but the \
+                 channel itself read 0 bytes this boot (missing or empty) -- NO entropy \
+                 was actually credited from any source. Per the stated hard limit, a \
+                 fully hostile hypervisor cannot be defeated without a working trusted \
+                 channel, and this boot didn't have one\n",
+                Pct(scores[3].final_belief_ppm),
+            );
+        } else {
+            pr_warn!(
+                "fw_cfg-seed: final belief_corrupt={} >= safety threshold \
+                 {} -- UNTRUSTED. No source cleared the safety filter this boot; the CRNG \
+                 is getting 0 bits of credited entropy from this module\n",
+                Pct(scores[3].final_belief_ppm), Pct(SAFETY_THRESHOLD_PPM),
+            );
+        }
+
         let seed_report = append(&seed_rounds_report, &seed_status);
 
         let mut policy_report = CString::try_from_fmt(fmt!(
@@ -695,11 +906,17 @@ impl kernel::Module for GtUrandomRs {
              RDRAND patch: {} added lines (cheap-tier limit: {})\n\
              virtio-rng patch: {} added lines  timing patch: {} added lines\n\
              fw_cfg-seed: not measurable this way (out-of-process category, see source)\n\n\
+             safety threshold {} proven at compile time, not hand-verified in a\n\
+             comment: a cost=1 source that passes every round still can't clear it,\n\
+             re-checked against this build's actual round counts (RDRAND={}, virtio-rng={})\n\n\
              layer 1 (adaptive multi-round belief) -> layer 2 (equilibrium credit split):\n",
             MEASURED_RDRAND_PATCH_LINES,
             CHEAP_TIER_PATCH_LINE_LIMIT,
             MEASURED_VIRTIO_RNG_PATCH_LINES,
             MEASURED_TIMING_PATCH_LINES,
+            Pct(SAFETY_THRESHOLD_PPM),
+            RDRAND_ROUNDS,
+            VIRTIO_ROUNDS,
         ))
         .unwrap_or_else(|_| error_cstring());
         for s in &scores {
@@ -712,11 +929,16 @@ impl kernel::Module for GtUrandomRs {
             if scores[0].equilibrium_weight_ppm > 0 { "trusted" } else { "untrusted" },
             if scores[1].equilibrium_weight_ppm > 0 { "trusted" } else { "untrusted" },
             if scores[2].equilibrium_weight_ppm > 0 { "trusted" } else { "untrusted" },
-            if scores[3].equilibrium_weight_ppm > 0 { "trusted" } else { "untrusted" },
+            // Same reasoning as the verdict log above: "trusted" here has
+            // to mean bytes were actually credited, not just that the
+            // belief math cleared the safety filter, or this one-line
+            // summary (the first thing anyone glances at) would claim
+            // success on a boot that credited nothing.
+            if scores[3].equilibrium_weight_ppm > 0 && seed_bytes_read > 0 { "trusted" } else { "untrusted" },
         ))
         .unwrap_or_else(|_| error_cstring());
 
-        pr_info!("gt_urandom_rs: {}\n", summary.to_str().unwrap_or("?"));
+        pr_info!("{}\n", summary.to_str().unwrap_or("?"));
 
         let debugfs = Dir::new(c_str!("gt_urandom_rs"));
         let summary = Report(summary);

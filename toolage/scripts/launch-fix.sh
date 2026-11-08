@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fix config: identical guest image/kernel and identical poisoned sources
-# (RDRAND, virtio-rng, no NIC) as scripts/launch-attack.sh, but the
+# (RDRAND, virtio-rng, no NIC) as toolage/scripts/launch-attack.sh, but the
 # gt_urandom module is loaded (gt=1) and a trusted seed is injected via
 # QEMU fw_cfg (opt/seed) -- the one channel outside the simulated
 # hypervisor's reach. The module distrusts RDRAND/virtio-rng by policy and
@@ -12,11 +12,12 @@
 # opposite: that the result is unpredictable to an attacker who only
 # controls RDRAND/virtio-rng/timing.
 #
-# Usage: scripts/launch-fix.sh [N]   (N = number of independent boots to
+# Usage: toolage/scripts/launch-fix.sh [N]   (N = number of independent boots to
 # run; default 3). Set GT_POISON_RDRAND to match the attack config's
 # attacker-chosen seed (same attacker, same tricks, module loaded this time).
 set -e
-R=$(cd "$(dirname "$0")/.." && pwd)
+R=$(cd "$(dirname "$0")/../.." && pwd)
+. "$R/toolage/scripts/lib/style.sh"
 QEMU="$R/build/qemu-src/build-out/qemu-system-x86_64"
 N="${1:-3}"
 TMO="${TMO:-30}"
@@ -24,7 +25,7 @@ TMO="${TMO:-30}"
 [ -f "$R/build/fixed-rng.bin" ] || head -c 4096 /dev/zero | tr '\0' 'A' > "$R/build/fixed-rng.bin"
 
 export GT_POISON_RDRAND="${GT_POISON_RDRAND:-deadbeefcafef00d}"
-echo "GT: attacker-chosen RDRAND seed = $GT_POISON_RDRAND (same attacker as the attack config)"
+gt_log "same attacker seed ($GT_POISON_RDRAND), module loaded this time"
 
 keys=()
 for i in $(seq 1 "$N"); do
@@ -34,6 +35,7 @@ for i in $(seq 1 "$N"); do
   SEED="$R/build/seed-$i.bin"
   head -c 32 /dev/urandom > "$SEED"
   OUT=$(mktemp)
+  gt_cmd "qemu-system-x86_64 -append gt=1 -fw_cfg name=opt/seed,file=$SEED [boot $i]"
   timeout "$TMO" "$QEMU" \
     -machine q35 -cpu qemu64,+rdrand -m 512 -smp 1 -accel tcg -icount shift=6,sleep=off \
     -kernel "$R/build/linux-src/arch/x86/boot/bzImage" \
@@ -44,9 +46,8 @@ for i in $(seq 1 "$N"); do
     -device virtio-rng-pci,rng=rng0 \
     -fw_cfg name=opt/seed,file="$SEED" \
     -serial file:"$OUT" ${GT_QEMU_EXTRA} >/dev/null 2>&1
-  echo -n "boot $i: "
-  line=$(grep -E "GT-HOSTKEY" "$OUT") || { echo "(no key -- boot failed, see $OUT)"; rm -f "$OUT"; exit 1; }
-  echo "$line"
+  line=$(grep -E "GT-HOSTKEY" "$OUT") || { gt_log "boot $i: no key, see $OUT"; rm -f "$OUT"; exit 1; }
+  gt_log "boot $i: ${line#GT-HOSTKEY: }"
   keys+=("$line")
   rm -f "$OUT"
 done
@@ -56,8 +57,8 @@ for ((i = 1; i < ${#keys[@]}; i++)); do
   [ "${keys[i]}" = "${keys[0]}" ] || all_same=0
 done
 if [ "$all_same" = 1 ]; then
-  echo "GT: VERDICT -- all $N boots produced the SAME key (unexpected for the fix config!)" >&2
+  gt_log "VERDICT: all $N boots produced the SAME key (unexpected for the fix config!)"
   exit 1
 else
-  echo "GT: VERDICT -- keys DIFFER across boots (fix succeeded)"
+  gt_log "VERDICT: keys DIFFER across boots (fix succeeded)"
 fi

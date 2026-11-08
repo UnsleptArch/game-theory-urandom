@@ -1,0 +1,73 @@
+#!/bin/busybox sh
+# "Visual + live SSH" demo init: brings up networking and a real sshd (not
+# just ssh-keygen + poweroff). The SSH host key sshd actually presents
+# comes from the SAME poisoned entropy pipeline as every other demo in
+# this project -- the point here is that the host can predict it via
+# replay, then literally log in over SSH and show the live connection
+# presents that exact predicted key.
+#
+# Only an ED25519 host key is generated -- NOT `ssh-keygen -A` (which
+# also does RSA). RSA keygen's prime search is CPU-heavy enough that
+# under -icount pacing plus replay's verification overhead it took
+# several *minutes* instead of instant, confirmed by actually hitting
+# that wall during testing; ED25519 is cheap to generate and is all this
+# demo needs. sshd_config is told explicitly to offer only this key, so
+# it never goes looking for the RSA/ECDSA files that don't exist.
+bb=/bin/busybox
+"$bb" mount -t proc proc /proc
+"$bb" mount -t sysfs sys /sys
+"$bb" mount -t devtmpfs dev /dev 2>/dev/null
+"$bb" mount -t tmpfs tmp /tmp
+# devtmpfs gives us /dev/ptmx, but allocating an actual PTY (what every
+# interactive SSH session needs) requires the devpts filesystem itself to
+# be mounted -- without it openpty() fails with ENOENT. Confirmed this
+# directly: auth succeeded, but the shell session failed right after with
+# "openpty: No such file or directory" / "session_pty_req: session 0
+# alloc failed" until this was added.
+"$bb" mkdir -p /dev/pts
+"$bb" mount -t devpts devpts /dev/pts
+"$bb" mkdir -p /var/empty /run/sshd
+"$bb" chown root:root /var/empty
+"$bb" chmod 711 /var/empty
+# sshd's privilege-separation preauth child needs a dedicated unprivileged
+# user; the base rootfs doesn't ship one (it never ran sshd before).
+"$bb" grep -q "^sshd:" /etc/passwd || echo "sshd:x:100:100:sshd privsep:/var/empty:/sbin/nologin" >> /etc/passwd
+"$bb" grep -q "^sshd:" /etc/group || echo "sshd:x:100:" >> /etc/group
+
+echo "[*] bringing up network (user-mode NAT)"
+"$bb" ip link set lo up 2>/dev/null || "$bb" ifconfig lo up
+"$bb" ip link set eth0 up 2>/dev/null || "$bb" ifconfig eth0 up
+"$bb" udhcpc -i eth0 -q -n 2>&1
+
+"$bb" rm -f /etc/ssh/ssh_host_*
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key
+echo "HostKey /etc/ssh/ssh_host_ed25519_key" >> /etc/ssh/sshd_config
+echo "GT-HOSTKEY: $(/usr/bin/ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub)"
+
+# Base rootfs ships root locked ("!" in /etc/shadow); this demo logs in
+# via pubkey only (PasswordAuthentication is already off in
+# sshd_config), so this just unlocks the account for sshd's own check,
+# not a password.
+"$bb" sed -i 's/^root:!:/root:*:/' /etc/shadow
+# /root and /root/.ssh come from the packed host tarball with the host
+# user's numeric UID baked in, not guest root's -- sshd's strict mode
+# checks ownership, not just permission bits, so fix both explicitly.
+"$bb" chown root:root /root
+"$bb" chmod 700 /root
+"$bb" mkdir -p /root/.ssh
+"$bb" chown root:root /root/.ssh
+"$bb" chmod 700 /root/.ssh
+"$bb" cp /opt/demo-authorized_keys /root/.ssh/authorized_keys
+"$bb" chown root:root /root/.ssh/authorized_keys
+"$bb" chmod 600 /root/.ssh/authorized_keys
+
+# Not exec'd: sshd is PID 1 here (no other init), and if it ever exits
+# (misconfig, killed connection, whatever) that would panic the kernel
+# with nothing left to reap. Run it as a child instead and idle forever
+# if it dies, so a soft failure shows as "no more sshd" on the console
+# rather than a kernel panic mid-demo.
+echo "[*] network + login ready"
+/usr/sbin/sshd -D -e &
+wait
+echo "[*] sshd exited -- idling"
+while true; do "$bb" sleep 3600; done
